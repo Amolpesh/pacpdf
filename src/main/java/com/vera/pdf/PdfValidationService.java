@@ -49,6 +49,7 @@ import org.apache.pdfbox.pdmodel.graphics.form.PDFormXObject;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationLink;
+import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationPopup;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
 import org.apache.pdfbox.pdmodel.interactive.viewerpreferences.PDViewerPreferences;
@@ -224,10 +225,8 @@ public class PdfValidationService {
 
 	private void fixArtifactIssues(PDDocument document) throws IOException {
 		for (PDPage page : document.getPages()) {
-			wrapPageContentAsArtifact(document, page);
 			PDResources resources = page.getResources();
 			if (resources != null) {
-				sanitizeFormXObjects(resources, new HashSet<>());
 				scanXObjectsForArtifacts(resources, new HashSet<>());
 			}
 		}
@@ -428,12 +427,17 @@ public class PdfValidationService {
 	}
 
 	private void fixAnnotationAndFormIssues(PDDocument document) throws IOException {
+		PDStructureTreeRoot structureTreeRoot = document.getDocumentCatalog().getStructureTreeRoot();
 		int nextStructParent = nextStructParentKey(document);
 		for (PDPage page : document.getPages()) {
 			if (!page.getAnnotations().isEmpty()) {
 				page.getCOSObject().setName(COSName.getPDFName("Tabs"), "S");
 			}
 			for (PDAnnotation annotation : page.getAnnotations()) {
+				if (annotation instanceof PDAnnotationPopup) {
+					removeAnnotationReferences(structureTreeRoot, annotation);
+					continue;
+				}
 				String enclosingAlt = findEnclosingStructureAlt(document, annotation);
 				if (enclosingAlt != null && !enclosingAlt.isBlank()
 						&& !enclosingAlt.equals(annotation.getContents())) {
@@ -445,9 +449,11 @@ public class PdfValidationService {
 				if (annotation instanceof PDAnnotationLink linkAnnotation) {
 					ensureLinkAnnotationStructure(document, page, linkAnnotation);
 				}
+				else {
+					ensureAnnotationStructure(structureTreeRoot, page, annotation);
+				}
 			}
 		}
-		PDStructureTreeRoot structureTreeRoot = document.getDocumentCatalog().getStructureTreeRoot();
 		if (structureTreeRoot != null) {
 			structureTreeRoot.setParentTreeNextKey(Math.max(structureTreeRoot.getParentTreeNextKey(), nextStructParent));
 		}
@@ -459,6 +465,9 @@ public class PdfValidationService {
 			return;
 		}
 		removeAnnotationReferences(structureTreeRoot, annotation);
+		if (appendAnnotationToExistingLink(structureTreeRoot, page, annotation)) {
+			return;
+		}
 		if (ensurePageTextWrappedInLink(structureTreeRoot, page, annotation)) {
 			return;
 		}
@@ -483,6 +492,47 @@ public class PdfValidationService {
 		objectReference.setPage(page);
 		link.appendKid(objectReference);
 		paragraph.appendKid(link);
+		documentElement.appendKid(paragraph);
+	}
+
+	private boolean appendAnnotationToExistingLink(
+			PDStructureNode node, PDPage page, PDAnnotationLink annotation) {
+		for (Object kid : node.getKids()) {
+			if (kid instanceof PDStructureElement element) {
+				if ("Link".equals(effectiveStructureType(element)) && isSamePage(element, page)
+						&& hasDirectNonAnnotationContent(element)) {
+					PDObjectReference objectReference = new PDObjectReference();
+					objectReference.setReferencedObject(annotation);
+					objectReference.setPage(page);
+					element.appendKid(objectReference);
+					return true;
+				}
+				if (appendAnnotationToExistingLink(element, page, annotation)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private void ensureAnnotationStructure(
+			PDStructureTreeRoot structureTreeRoot, PDPage page, PDAnnotation annotation) {
+		if (structureTreeRoot == null) {
+			return;
+		}
+		removeAnnotationReferences(structureTreeRoot, annotation);
+		PDStructureElement documentElement = rootDocumentElement(structureTreeRoot);
+		if (documentElement == null) {
+			return;
+		}
+
+		PDStructureElement paragraph = new PDStructureElement("P", documentElement);
+		paragraph.setPage(page);
+
+		PDObjectReference objectReference = new PDObjectReference();
+		objectReference.setReferencedObject(annotation);
+		objectReference.setPage(page);
+		paragraph.appendKid(annotationElement(paragraph, page, objectReference));
 		documentElement.appendKid(paragraph);
 	}
 
@@ -567,6 +617,20 @@ public class PdfValidationService {
 	private boolean hasDirectNonLinkContent(PDStructureElement element) {
 		for (Object kid : element.getKids()) {
 			if (kid instanceof PDStructureElement child && "Link".equals(effectiveStructureType(child))) {
+				continue;
+			}
+			return true;
+		}
+		return false;
+	}
+
+	private boolean hasDirectNonAnnotationContent(PDStructureElement element) {
+		for (Object kid : element.getKids()) {
+			if (kid instanceof PDStructureElement child && "Annot".equals(effectiveStructureType(child))) {
+				continue;
+			}
+			if (kid instanceof PDObjectReference objectReference
+					&& objectReference.getReferencedObject() instanceof PDAnnotation) {
 				continue;
 			}
 			return true;
