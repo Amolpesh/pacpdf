@@ -37,6 +37,7 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentCatalog;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.common.COSObjectable;
+import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDPropertyList;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDMarkInfo;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDObjectReference;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureElement;
@@ -153,6 +154,7 @@ public class PdfValidationService {
 			fixAnnotationAndFormIssues(document);
 			fixFontAndTextIssues(document);
 			fixColorAndPdfSyntaxIssues(document);
+			ensureMarkedContentStructureEntries(document);
 			rebuildStructuralParentTree(document);
 			document.save(outputPath.toFile());
 		}
@@ -225,8 +227,10 @@ public class PdfValidationService {
 
 	private void fixArtifactIssues(PDDocument document) throws IOException {
 		for (PDPage page : document.getPages()) {
+			wrapPageContentAsArtifact(document, page);
 			PDResources resources = page.getResources();
 			if (resources != null) {
+				sanitizeFormXObjects(resources, new HashSet<>());
 				scanXObjectsForArtifacts(resources, new HashSet<>());
 			}
 		}
@@ -241,7 +245,7 @@ public class PdfValidationService {
 			ContentStreamWriter writer = new ContentStreamWriter(output);
 			var streams = page.getContentStreams();
 			while (streams.hasNext()) {
-				writeArtifactSanitizedTokens(streams.next(), writer);
+				writeStreamAsSingleArtifact(streams.next(), writer, page.getResources());
 			}
 		}
 		page.setContents(repairedStream);
@@ -254,7 +258,7 @@ public class PdfValidationService {
 		for (COSName name : resources.getXObjectNames()) {
 			PDXObject xObject = resources.getXObject(name);
 			if (xObject instanceof PDFormXObject form) {
-				rewriteContentStream(form.getContentStream());
+				rewriteContentStream(form.getContentStream(), form.getResources());
 				if (form.getResources() != null) {
 					sanitizeFormXObjects(form.getResources(), visitedResources);
 				}
@@ -262,14 +266,118 @@ public class PdfValidationService {
 		}
 	}
 
-	private void rewriteContentStream(PDStream stream) throws IOException {
+	private void rewriteContentStream(PDStream stream, PDResources resources) throws IOException {
 		List<Object> tokens;
 		try (var input = stream.createInputStream()) {
 			tokens = new PDFStreamParser(input.readAllBytes()).parse();
 		}
 		try (var output = stream.createOutputStream(COSName.FLATE_DECODE)) {
-			writeArtifactSanitizedTokens(tokens, new ContentStreamWriter(output));
+			writeStreamAsSingleArtifact(tokens, new ContentStreamWriter(output), resources);
 		}
+	}
+
+	private void writeStreamAsSingleArtifact(PDStream stream, ContentStreamWriter writer, PDResources resources)
+			throws IOException {
+		List<Object> tokens;
+		try (var input = stream.createInputStream()) {
+			tokens = new PDFStreamParser(input.readAllBytes()).parse();
+		}
+		writeStreamAsSingleArtifact(tokens, writer, resources);
+	}
+
+	private void writeStreamAsSingleArtifact(List<Object> tokens, ContentStreamWriter writer, PDResources resources)
+			throws IOException {
+		List<Object> operands = new ArrayList<>();
+		int artifactDepth = 0;
+		boolean textObjectOpen = false;
+		boolean pathOpen = false;
+		List<MarkedContentState> markedContentStack = new ArrayList<>();
+
+		for (Object token : tokens) {
+			if (!(token instanceof Operator operator)) {
+				operands.add(token);
+				continue;
+			}
+
+			String operatorName = operator.getName();
+			if ("BMC".equals(operatorName) || "BDC".equals(operatorName)) {
+				boolean artifactMarkedContent = isArtifactMarkedContent(operands);
+				boolean taggedMarkedContent = isTaggedMarkedContent(operands, resources);
+				boolean untaggedContent = !artifactMarkedContent && !taggedMarkedContent
+						&& !hasTaggedAncestor(markedContentStack);
+				boolean suppressedMarkedContent = untaggedContent && (textObjectOpen || pathOpen);
+				if (untaggedContent && !suppressedMarkedContent) {
+					writer.writeToken(COSName.ARTIFACT);
+					writer.writeToken(Operator.getOperator("BMC"));
+					artifactMarkedContent = true;
+				}
+				else if (!suppressedMarkedContent) {
+					writeOperatorGroup(writer, operands, operator);
+				}
+				operands.clear();
+				markedContentStack.add(new MarkedContentState(artifactMarkedContent, taggedMarkedContent,
+						suppressedMarkedContent));
+				if (artifactMarkedContent) {
+					artifactDepth++;
+				}
+			}
+			else if ("EMC".equals(operatorName)) {
+				MarkedContentState markedContentState = null;
+				if (!markedContentStack.isEmpty()) {
+					markedContentState = markedContentStack.remove(markedContentStack.size() - 1);
+					if (markedContentState.artifact() && artifactDepth > 0) {
+						artifactDepth--;
+					}
+				}
+				if (markedContentState == null || !markedContentState.suppressed()) {
+					writeOperatorGroup(writer, operands, operator);
+				}
+				operands.clear();
+			}
+			else {
+				writeOperatorGroup(writer, operands, operator);
+				operands.clear();
+				if ("BT".equals(operatorName)) {
+					textObjectOpen = true;
+				}
+				else if ("ET".equals(operatorName)) {
+					textObjectOpen = false;
+				}
+				else if (isPathConstructionOperator(operatorName)) {
+					pathOpen = true;
+				}
+				else if (isPathPaintingOperator(operatorName)) {
+					pathOpen = false;
+				}
+			}
+		}
+	}
+
+	private boolean hasTaggedAncestor(List<MarkedContentState> markedContentStack) {
+		return markedContentStack.stream().anyMatch(MarkedContentState::tagged);
+	}
+
+	private boolean isPathConstructionOperator(String operatorName) {
+		return "m".equals(operatorName)
+				|| "l".equals(operatorName)
+				|| "c".equals(operatorName)
+				|| "v".equals(operatorName)
+				|| "y".equals(operatorName)
+				|| "h".equals(operatorName)
+				|| "re".equals(operatorName);
+	}
+
+	private boolean isPathPaintingOperator(String operatorName) {
+		return "S".equals(operatorName)
+				|| "s".equals(operatorName)
+				|| "f".equals(operatorName)
+				|| "F".equals(operatorName)
+				|| "f*".equals(operatorName)
+				|| "B".equals(operatorName)
+				|| "B*".equals(operatorName)
+				|| "b".equals(operatorName)
+				|| "b*".equals(operatorName)
+				|| "n".equals(operatorName);
 	}
 
 	private void writeArtifactSanitizedTokens(PDStream stream, ContentStreamWriter writer) throws IOException {
@@ -354,18 +462,31 @@ public class PdfValidationService {
 	}
 
 	private boolean isTaggedMarkedContent(List<Object> operands) {
-		if (operands.size() < 2) {
-			return false;
-		}
-		Object properties = operands.get(1);
-		if (properties instanceof COSDictionary dictionary) {
-			return dictionary.getDictionaryObject(COSName.MCID) != null;
-		}
-		return false;
+		return isTaggedMarkedContent(operands, null);
+	}
+
+	private boolean isTaggedMarkedContent(List<Object> operands, PDResources resources) {
+		COSDictionary properties = markedContentProperties(operands, resources);
+		return properties != null && properties.getDictionaryObject(COSName.MCID) != null;
 	}
 
 	private boolean isArtifactMarkedContent(List<Object> operands) {
 		return !operands.isEmpty() && COSName.ARTIFACT.equals(operands.get(0));
+	}
+
+	private COSDictionary markedContentProperties(List<Object> operands, PDResources resources) {
+		if (operands.size() < 2) {
+			return null;
+		}
+		Object properties = operands.get(1);
+		if (properties instanceof COSDictionary dictionary) {
+			return dictionary;
+		}
+		if (properties instanceof COSName name && resources != null) {
+			PDPropertyList propertyList = resources.getProperties(name);
+			return propertyList == null ? null : propertyList.getCOSObject();
+		}
+		return null;
 	}
 
 	private boolean isTextShowingOperator(String operatorName) {
@@ -1145,6 +1266,107 @@ public class PdfValidationService {
 		return structureTreeRoot == null ? 0 : Math.max(0, structureTreeRoot.getParentTreeNextKey());
 	}
 
+	private void ensureMarkedContentStructureEntries(PDDocument document) throws IOException {
+		PDStructureTreeRoot structureTreeRoot = document.getDocumentCatalog().getStructureTreeRoot();
+		if (structureTreeRoot == null) {
+			return;
+		}
+		PDStructureElement documentElement = rootDocumentElement(structureTreeRoot);
+		if (documentElement == null) {
+			return;
+		}
+
+		Set<PageMcid> contentMcids = collectContentStreamMcids(document);
+		if (contentMcids.isEmpty()) {
+			return;
+		}
+		Set<PageMcid> structureMcids = collectStructureMcids(structureTreeRoot);
+		for (PageMcid pageMcid : contentMcids) {
+			if (!structureMcids.contains(pageMcid)) {
+				PDStructureElement paragraph = new PDStructureElement("P", documentElement);
+				paragraph.setPage(pageMcid.page());
+				paragraph.appendKid(pageMcid.mcid());
+				documentElement.appendKid(paragraph);
+				structureMcids.add(pageMcid);
+			}
+		}
+	}
+
+	private Set<PageMcid> collectContentStreamMcids(PDDocument document) throws IOException {
+		Set<PageMcid> mcids = new HashSet<>();
+		for (PDPage page : document.getPages()) {
+			if (!page.hasContents()) {
+				continue;
+			}
+			var streams = page.getContentStreams();
+			while (streams.hasNext()) {
+				collectContentStreamMcids(page, streams.next(), page.getResources(), mcids);
+			}
+		}
+		return mcids;
+	}
+
+	private void collectContentStreamMcids(PDPage page, PDStream stream, PDResources resources, Set<PageMcid> mcids)
+			throws IOException {
+		List<Object> tokens;
+		try (var input = stream.createInputStream()) {
+			tokens = new PDFStreamParser(input.readAllBytes()).parse();
+		}
+		List<Object> operands = new ArrayList<>();
+		for (Object token : tokens) {
+			if (!(token instanceof Operator operator)) {
+				operands.add(token);
+				continue;
+			}
+			if ("BDC".equals(operator.getName())) {
+				int mcid = mcidFromMarkedContentOperands(operands, resources);
+				if (mcid >= 0) {
+					mcids.add(new PageMcid(page, mcid));
+				}
+			}
+			operands.clear();
+		}
+	}
+
+	private int mcidFromMarkedContentOperands(List<Object> operands, PDResources resources) {
+		COSDictionary dictionary = markedContentProperties(operands, resources);
+		if (dictionary == null) {
+			return -1;
+		}
+		return dictionary.getInt(COSName.MCID, -1);
+	}
+
+	private Set<PageMcid> collectStructureMcids(PDStructureTreeRoot structureTreeRoot) {
+		Set<PageMcid> mcids = new HashSet<>();
+		for (Object kid : structureTreeRoot.getKids()) {
+			if (kid instanceof PDStructureElement element) {
+				collectStructureMcids(element, element.getPage(), mcids);
+			}
+		}
+		return mcids;
+	}
+
+	private void collectStructureMcids(PDStructureElement element, PDPage inheritedPage, Set<PageMcid> mcids) {
+		PDPage currentPage = element.getPage() != null ? element.getPage() : inheritedPage;
+		for (Object kid : element.getKids()) {
+			if (kid instanceof PDStructureElement childElement) {
+				collectStructureMcids(childElement, currentPage, mcids);
+			}
+			else if (kid instanceof PDMarkedContentReference markedContentReference) {
+				PDPage page = markedContentReference.getPage() != null ? markedContentReference.getPage() : currentPage;
+				if (page != null && markedContentReference.getMCID() >= 0) {
+					mcids.add(new PageMcid(page, markedContentReference.getMCID()));
+				}
+			}
+			else if (kid instanceof Number number && currentPage != null) {
+				mcids.add(new PageMcid(currentPage, number.intValue()));
+			}
+			else if (kid instanceof COSInteger integer && currentPage != null) {
+				mcids.add(new PageMcid(currentPage, integer.intValue()));
+			}
+		}
+	}
+
 	private void rebuildStructuralParentTree(PDDocument document) throws IOException {
 		PDStructureTreeRoot structureTreeRoot = document.getDocumentCatalog().getStructureTreeRoot();
 		if (structureTreeRoot == null) {
@@ -1807,5 +2029,11 @@ public class PdfValidationService {
 	}
 
 	private record RuleSummary(List<PdfRuleResult> passedRules, List<PdfRuleResult> failedRules) {
+	}
+
+	private record MarkedContentState(boolean artifact, boolean tagged, boolean suppressed) {
+	}
+
+	private record PageMcid(PDPage page, int mcid) {
 	}
 }
