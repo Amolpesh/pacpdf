@@ -17,16 +17,25 @@ import org.springframework.web.multipart.MultipartFile;
 public class PdfValidationController {
 
 	private final PdfValidationService pdfValidationService;
+	private final AdvancedPdfValidationService advancedPdfValidationService;
 
-	public PdfValidationController(PdfValidationService pdfValidationService) {
+	public PdfValidationController(
+			PdfValidationService pdfValidationService,
+			AdvancedPdfValidationService advancedPdfValidationService) {
 		this.pdfValidationService = pdfValidationService;
+		this.advancedPdfValidationService = advancedPdfValidationService;
 	}
 
 	@PostMapping(path = "/validate-fix", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
 	public PdfValidationResponse validateAndFix(
 			@RequestParam("file") MultipartFile file,
-			@RequestParam(defaultValue = "true") boolean fix) {
-		return pdfValidationService.validateAndFix(file, fix);
+			@RequestParam(defaultValue = "true") boolean fix,
+			@RequestParam(defaultValue = "standard") String mode) {
+		return switch (mode.toLowerCase()) {
+			case "standard" -> pdfValidationService.validateAndFix(file, fix);
+			case "advanced" -> advancedPdfValidationService.validateAndFix(file, fix);
+			default -> throw new PdfValidationException("Unsupported validation mode: " + mode);
+		};
 	}
 
 	@ExceptionHandler(PdfValidationException.class)
